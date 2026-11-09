@@ -1,0 +1,644 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+<title>Face AR Sunglasses</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+               font-family: system-ui, -apple-system, sans-serif; }
+  #stage { position: fixed; inset: 0; }
+  /* 비디오와 캔버스를 같은 방식(cover, 좌우반전)으로 맞춰야 안경 위치가 얼굴과 일치함 */
+  #stage video, #stage canvas {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; transform: scaleX(-1);
+  }
+  #overlay-msg { position: absolute; inset: 0; display: flex;
+                 align-items: center; justify-content: center; }
+  #start { font-size: 18px; padding: 14px 28px; border: 0; border-radius: 999px;
+           background: #fff; color: #111; cursor: pointer; }
+  #start:disabled { opacity: .5; cursor: default; }
+  #status { position: absolute; left: 12px; top: 12px; color: #fff;
+            background: rgba(0,0,0,.55); padding: 6px 10px; border-radius: 8px; font-size: 13px; }
+  #status:empty { display: none; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline muted autoplay></video>
+  <canvas id="canvas"></canvas>
+</div>
+<div id="status"></div>
+<div id="overlay-msg"><button id="start">카메라 시작</button></div>
+
+<script type="module">
+import * as THREE from "three";
+import { OBJLoader } from "three/addons/loaders/OBJLoader.js";
+import { toCreasedNormals } from "three/addons/utils/BufferGeometryUtils.js";
+import { FaceLandmarker, HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
+
+/* ───────────── 튜닝 설정 ───────────── */
+const CONFIG = {
+  modelUrl: "glasses_v2.obj",   // frame / lens_L / lens_R 로 나뉜 모델
+  frameRatio: 1.4,              // 안경테 전체 폭 ÷ 양쪽 눈 바깥 모서리 거리
+  offsetY: 0.0,                 // 콧등에 맞춘 위치에서 세로 보정 (안경 앞면 폭 대비 비율, +면 위)
+  smoothing: 0.35,              // 0~1, 클수록 빠르게 따라감 / 작을수록 떨림 감소
+  poseSource: "matrix",         // "matrix"(facialTransformationMatrix) | "landmark"(눈·이마 기반 근사)
+  matrixRowMajor: true,         // 변환 행렬이 행 우선(row-major)이면 true, 열 우선이면 false
+  occluderBackMM: 3,            // 얼굴 표면을 렌즈 평면보다 뒤로 밀어내는 거리(mm 단위)
+  occluderSideMarginMM: 2,      // 얼굴 가림 메시의 좌우 끝을 안경 다리 안쪽 면보다 안으로 들이는 거리(mm 단위)
+  earTopOffsetMM: 0,            // 귀 위 기준점(랜드마크 127, 356)에서 다리가 지나갈 높이 보정(mm, +면 위)
+  earOutMM: 3,                  // 귀 옆 얼굴 윤곽보다 다리를 바깥으로 띄우는 거리(모델 mm 단위)
+  templeMaxAngleDeg: 15,        // 다리를 힌지에서 위아래·바깥으로 돌릴 수 있는 최대 각도
+  handLift: true,               // 손가락으로 브릿지를 잡아 안경을 올리는 기능 on/off
+  handGrabRadius: 0.18,         // 손가락이 브릿지를 잡았다고 보는 거리 (안경 앞면 폭 대비 비율)
+  handMaxLiftMM: 10,            // 안경을 올릴 수 있는 최대 높이 (모델 mm 단위)
+  handDetectEvery: 3,           // 손 인식을 몇 프레임에 한 번 돌릴지 (클수록 가벼움)
+  occlusion: true,              // 얼굴에 가려지는 부분 처리 on/off
+  yawSign: 1,                   // landmark 모드에서 좌우 회전이 반대면 -1
+  pitchSign: 1,                 // landmark 모드에서 상하 회전이 반대면 -1
+};
+
+// MediaPipe Face Landmarker 랜드마크 번호
+const IDX = { rightOuter: 33, rightInner: 133, leftInner: 362, leftOuter: 263, forehead: 10, chin: 152, noseBridge: 6,
+              earTopMinusX: 127, earTopPlusX: 356 };   // 귀 랜드마크가 없어 귀 윗부분에 가장 가까운 얼굴 윤곽점을 사용
+
+/* ───────────── DOM ───────────── */
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const statusEl = document.getElementById("status");
+const startBtn = document.getElementById("start");
+const setStatus = (t) => (statusEl.textContent = t);
+
+/* ───────────── Three.js 기본 세팅 ───────────── */
+const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+renderer.setClearColor(0x000000, 0);
+
+const scene = new THREE.Scene();
+scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(0, 1, 2);
+scene.add(dirLight);
+
+const CAM_DIST = 100;
+const camera = new THREE.PerspectiveCamera(45, 1, 20, 500);
+camera.position.set(0, 0, CAM_DIST);
+
+// 화면 정규화 좌표(0~1)를 월드 좌표로 바꾸기 위한 가시 영역 (init에서 계산)
+let visW = 1, visH = 1;
+
+// 안경 전체 트랜스폼 그룹 (위치/회전/크기)
+const glassesPivot = new THREE.Group();
+glassesPivot.visible = false;
+scene.add(glassesPivot);
+
+/* ───────────── 머티리얼 ───────────── */
+// 금속이 비칠 주변 환경: 어두운 스튜디오에 밝은 조명 띠를 두어 크롬 특유의 흑백 대비를 만든다
+function makeStudioEnvironment() {
+  const env = new THREE.Scene();
+  env.background = new THREE.Color(0x24262a);
+  const panel = (w, h, x, y, z, intensity) => {
+    const material = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+    material.color.setScalar(intensity);
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), material);
+    mesh.position.set(x, y, z);
+    mesh.lookAt(0, 0, 0);
+    env.add(mesh);
+  };
+  panel(14, 3, 0, 9, 2, 4);      // 위
+  panel(3, 12, -10, 2, 3, 3);    // 왼쪽
+  panel(3, 12, 10, 2, 3, 2.5);   // 오른쪽
+  panel(10, 2, 0, -2, 12, 1.5);  // 정면 아래
+  panel(18, 6, 0, -9, 0, 0.6);   // 바닥 반사
+  return new THREE.PMREMGenerator(renderer).fromScene(env, 0.02).texture;
+}
+scene.environment = makeStudioEnvironment();
+
+// 다리의 브러시드 결: 밝고 어두운 짧은 사선을 겹쳐 그린 반복 텍스처
+function makeBrushedTexture(size = 512) {
+  const c = document.createElement("canvas");
+  c.width = c.height = size;
+  const g = c.getContext("2d");
+  g.fillStyle = "#808080";
+  g.fillRect(0, 0, size, size);
+  for (let i = 0; i < 3200; i++) {
+    const x = Math.random() * size, y = Math.random() * size;
+    const len = 20 + Math.random() * 90;
+    const angle = -0.5 + Math.random() * 0.22;
+    g.strokeStyle = Math.random() < 0.5 ? "#ffffff" : "#000000";
+    g.globalAlpha = 0.08 + Math.random() * 0.28;
+    g.lineWidth = 0.5 + Math.random() * 0.9;
+    g.beginPath();
+    g.moveTo(x, y);
+    g.lineTo(x + Math.cos(angle) * len, y + Math.sin(angle) * len);
+    g.stroke();
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+
+// 렌즈의 에칭 선: 거의 투명한 바탕에 붓질처럼 뭉친 흰 선을 그린 알파 텍스처
+function makeLensAlphaTexture(width = 1024, height = 512) {
+  const c = document.createElement("canvas");
+  c.width = width; c.height = height;
+  const g = c.getContext("2d");
+  g.fillStyle = "#121212";       // 렌즈 바탕의 불투명도 (약 7%)
+  g.fillRect(0, 0, width, height);
+  g.strokeStyle = "#ffffff";
+  g.lineCap = "round";
+  for (let cluster = 0; cluster < 70; cluster++) {
+    const cx = Math.random() * width, cy = Math.random() * height;
+    const angle = -0.35 + Math.random() * 0.45;
+    for (let i = 0, n = 5 + Math.random() * 12; i < n; i++) {
+      const x = cx + (Math.random() - 0.5) * 70, y = cy + (Math.random() - 0.5) * 34;
+      const len = 30 + Math.random() * 100;
+      const bend = (Math.random() - 0.5) * 18;
+      const dx = Math.cos(angle) * len, dy = Math.sin(angle) * len;
+      g.globalAlpha = 0.08 + Math.random() * 0.3;
+      g.lineWidth = 0.4 + Math.random() * 0.6;
+      g.beginPath();
+      g.moveTo(x, y);
+      g.quadraticCurveTo(x + dx / 2, y + dy / 2 + bend, x + dx, y + dy);
+      g.stroke();
+    }
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+
+// 테와 브릿지: 광택 실버
+const frameMaterial = new THREE.MeshStandardMaterial({
+  color: 0xeceded, metalness: 1.0, roughness: 0.14, side: THREE.DoubleSide,
+});
+// 다리: 결이 있는 브러시드 실버
+const brushedTexture = makeBrushedTexture();
+const templeMaterial = new THREE.MeshStandardMaterial({
+  color: 0xe4e5e6, metalness: 1.0, roughness: 0.8, side: THREE.DoubleSide,
+  roughnessMap: brushedTexture, bumpMap: brushedTexture, bumpScale: 0.35,
+});
+// 렌즈: 투명한 바탕 + 흰 에칭 선
+const lensMaterial = new THREE.MeshStandardMaterial({
+  color: 0xffffff, metalness: 0.0, roughness: 0.2,
+  transparent: true, alphaMap: makeLensAlphaTexture(), depthWrite: false, side: THREE.DoubleSide,
+});
+
+// 렌즈 UV: 앞에서 본 평면 좌표. 양쪽 렌즈가 텍스처의 다른 부분을 쓰도록 안경 전체 폭에 펼친다
+function setLensUV(geometry) {
+  const pos = geometry.attributes.position;
+  const uv = new Float32Array(pos.count * 2);
+  for (let i = 0; i < pos.count; i++) {
+    uv[i * 2] = (pos.getX(i) + 60) / 120;
+    uv[i * 2 + 1] = (pos.getY(i) + 30) / 60;
+  }
+  geometry.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+}
+
+// 다리 UV: 삼각형마다 법선이 향하는 축으로 투영 (OBJ의 UV에 기대지 않기 위함)
+function setBoxUV(geometry, mmPerTile) {
+  const pos = geometry.attributes.position, nor = geometry.attributes.normal;
+  const uv = new Float32Array(pos.count * 2);
+  for (let t = 0; t < pos.count; t += 3) {
+    const nx = Math.abs(nor.getX(t) + nor.getX(t + 1) + nor.getX(t + 2));
+    const ny = Math.abs(nor.getY(t) + nor.getY(t + 1) + nor.getY(t + 2));
+    const nz = Math.abs(nor.getZ(t) + nor.getZ(t + 1) + nor.getZ(t + 2));
+    for (let v = t; v < t + 3; v++) {
+      const u = nz >= nx && nz >= ny ? pos.getX(v) : pos.getZ(v);
+      const w = ny >= nx && ny >= nz ? pos.getX(v) : pos.getY(v);
+      uv[v * 2] = u / mmPerTile;
+      uv[v * 2 + 1] = w / mmPerTile;
+    }
+  }
+  geometry.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+}
+
+/* ───────────── 안경 모델 로드 ───────────── */
+let modelWidth = 0;   // 안경 앞면 가로 폭 (mm)
+let templeInnerX = Infinity;   // 중심에서 안경 다리 안쪽 면까지의 최소 거리 (mm)
+let frameMesh = null;
+let bridgeY = 0;   // 안경 원점에서 브릿지 중심까지의 높이 (mm)
+
+/* ───────────── 안경 다리 분리 ───────────── */
+// 테 메시를 앞면과 좌우 다리로 나누고, 다리는 힌지 위치를 축으로 회전할 수 있는 그룹에 넣는다
+const TEMPLE_START_Z = -15;    // 이 깊이보다 뒤쪽 삼각형은 다리로 취급 (mm)
+const EAR_CONTACT_Z = -130;    // 다리가 귀 위에 걸리는 깊이 (mm). 중간에 꺾여 내려갔다가 다시 올라간 꼭대기 지점
+const temples = [];
+
+function bandCenter(geometry, zMax, zMin) {
+  const pos = geometry.attributes.position;
+  const box = new THREE.Box3();
+  const v = new THREE.Vector3();
+  for (let i = 0; i < pos.count; i++) {
+    const z = pos.getZ(i);
+    if (z > zMin && z < zMax) box.expandByPoint(v.fromBufferAttribute(pos, i));
+  }
+  return box.getCenter(new THREE.Vector3());
+}
+
+function splitTemples(mesh, offset) {
+  const src = mesh.geometry;   // OBJLoader 결과는 비인덱스 삼각형 목록
+  const pos = src.attributes.position, nor = src.attributes.normal;
+  const parts = { front: { p: [], n: [] }, plusX: { p: [], n: [] }, minusX: { p: [], n: [] } };
+  for (let t = 0; t < pos.count; t += 3) {
+    const z = (pos.getZ(t) + pos.getZ(t + 1) + pos.getZ(t + 2)) / 3;
+    const x = (pos.getX(t) + pos.getX(t + 1) + pos.getX(t + 2)) / 3;
+    const part = z > TEMPLE_START_Z ? parts.front : x > 0 ? parts.plusX : parts.minusX;
+    for (let v = t; v < t + 3; v++) {
+      part.p.push(pos.getX(v), pos.getY(v), pos.getZ(v));
+      part.n.push(nor.getX(v), nor.getY(v), nor.getZ(v));
+    }
+  }
+  const toGeometry = ({ p, n }) => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(p, 3));
+    g.setAttribute("normal", new THREE.Float32BufferAttribute(n, 3));
+    return g;
+  };
+  mesh.geometry = toGeometry(parts.front);
+
+  for (const [name, landmark] of [["plusX", IDX.earTopPlusX], ["minusX", IDX.earTopMinusX]]) {
+    const geometry = toGeometry(parts[name]);
+    const { x: hingeX, y: hingeY } = bandCenter(geometry, TEMPLE_START_Z, TEMPLE_START_Z - 10);
+    const contact = bandCenter(geometry, EAR_CONTACT_Z + 5, EAR_CONTACT_Z - 5);
+    const group = new THREE.Group();
+    group.position.set(hingeX, hingeY, TEMPLE_START_Z);
+    setBoxUV(geometry, 18);
+    const temple = new THREE.Mesh(geometry, templeMaterial);
+    temple.renderOrder = mesh.renderOrder;
+    temple.position.set(-hingeX, -hingeY, -TEMPLE_START_Z);
+    group.add(temple);
+    mesh.parent.add(group);
+    temples.push({
+      group, landmark,
+      hingeX: hingeX + offset.x,   // 이후 계산은 glassesPivot 로컬 좌표(mm) 기준
+      hingeY: hingeY + offset.y,
+      contactX: contact.x + offset.x,
+      contactAngle: Math.atan2(contact.y - hingeY, TEMPLE_START_Z - EAR_CONTACT_Z),
+    });
+  }
+}
+
+new OBJLoader().load(
+  CONFIG.modelUrl,
+  (obj) => {
+    obj.traverse((child) => {
+      if (!child.isMesh) return;
+      // 곡면은 매끄럽게, 40°보다 꺾인 모서리는 날카롭게 음영 처리
+      child.geometry = toCreasedNormals(child.geometry, THREE.MathUtils.degToRad(40));
+      const name = child.name || child.parent?.name || "";
+      const isLens = name.startsWith("lens");
+      if (isLens) setLensUV(child.geometry);
+      child.material = isLens ? lensMaterial : frameMaterial;
+      child.renderOrder = isLens ? 2 : 1;   // 렌즈는 투명이므로 마지막에 그림
+    });
+    // 원점을 렌즈 평면 중앙으로 이동 (x, y 중심만 맞추고 z는 유지)
+    const box = new THREE.Box3().setFromObject(obj);
+    const c = box.getCenter(new THREE.Vector3());
+    obj.position.set(-c.x, -c.y, 0);
+    // 다리는 뒤로 갈수록 벌어져 전체 폭이 앞면보다 넓으므로, 크기 기준은 앞면(z > -15mm) 폭으로 잡는다
+    let frontHalfWidth = 0, bridgeLow = Infinity, bridgeHigh = -Infinity;
+    obj.traverse((child) => {
+      if (!child.isMesh) return;
+      const pos = child.geometry.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        const x = Math.abs(pos.getX(i) - c.x);
+        if (pos.getZ(i) > -15) {
+          frontHalfWidth = Math.max(frontHalfWidth, x);
+          if (x < 2.5) {   // 렌즈 사이 중앙 부분 = 브릿지
+            bridgeLow = Math.min(bridgeLow, pos.getY(i));
+            bridgeHigh = Math.max(bridgeHigh, pos.getY(i));
+          }
+        } else {
+          templeInnerX = Math.min(templeInnerX, x);
+        }
+      }
+    });
+    modelWidth = frontHalfWidth * 2;
+    bridgeY = (bridgeLow + bridgeHigh) / 2 - c.y;
+    obj.traverse((child) => { if (child.name === "frame") frameMesh = child; });
+    if (frameMesh) splitTemples(frameMesh, obj.position);
+    glassesPivot.add(obj);
+    setStatus("");
+  },
+  undefined,
+  (err) => setStatus("모델 로드 실패: " + err.message)
+);
+
+/* ───────────── 얼굴 가림(occlusion)용 보이지 않는 얼굴 메시 ───────────── */
+// 색은 쓰지 않고 깊이만 기록 → 안경 뒤에 있는 얼굴/귀 쪽 다리는 가려짐
+const occluderGeometry = new THREE.BufferGeometry();
+const occluderPositions = new Float32Array(468 * 3);
+occluderGeometry.setAttribute("position", new THREE.BufferAttribute(occluderPositions, 3));
+const occluderMesh = new THREE.Mesh(
+  occluderGeometry,
+  new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: true, side: THREE.DoubleSide })
+);
+occluderMesh.renderOrder = -1;
+occluderMesh.visible = false;
+scene.add(occluderMesh);
+
+// FaceLandmarker의 연결 정보(edge 목록)에서 삼각형(3-clique)을 한 번만 만든다
+function buildOccluderIndex(connections) {
+  const adj = Array.from({ length: 468 }, () => new Set());
+  for (const { start, end } of connections) {
+    if (start < 468 && end < 468) { adj[start].add(end); adj[end].add(start); }
+  }
+  const tris = [];
+  for (let a = 0; a < 468; a++) {
+    for (const b of adj[a]) {
+      if (b <= a) continue;
+      for (const c of adj[a]) {
+        if (c > b && adj[b].has(c)) tris.push(a, b, c);
+      }
+    }
+  }
+  return new Uint16Array(tris);
+}
+
+/* ───────────── 카메라 + 얼굴 인식 초기화 ───────────── */
+let landmarker = null;
+let handLandmarker = null;
+let occluderReady = false;
+let ready = false;
+
+const FACE_MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const HAND_MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+async function createTask(TaskClass, fileset, modelAssetPath, options) {
+  const common = { runningMode: "VIDEO", ...options };
+  try {
+    return await TaskClass.createFromOptions(fileset, { ...common, baseOptions: { modelAssetPath, delegate: "GPU" } });
+  } catch (e) {
+    console.warn("GPU delegate 실패, CPU로 재시도:", e);
+    return await TaskClass.createFromOptions(fileset, { ...common, baseOptions: { modelAssetPath, delegate: "CPU" } });
+  }
+}
+
+async function init() {
+  startBtn.disabled = true;
+  setStatus("카메라 권한 요청 중...");
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await new Promise((r) => {
+    if (video.readyState >= 2) r();
+    else video.onloadeddata = () => r();
+  });
+  await video.play();
+
+  const vw = video.videoWidth, vh = video.videoHeight;
+  renderer.setSize(vw, vh, false);          // 캔버스 내부 해상도 = 비디오 해상도
+  camera.aspect = vw / vh;
+  camera.updateProjectionMatrix();
+  visH = 2 * CAM_DIST * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  visW = visH * camera.aspect;
+
+  setStatus("얼굴 인식 모델 로드 중...");
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  landmarker = await createTask(FaceLandmarker, fileset, FACE_MODEL, {
+    numFaces: 1,
+    outputFacialTransformationMatrixes: true,
+  });
+
+  // 손 인식은 부가 기능이므로 실패해도 안경 착용은 계속 동작한다
+  if (CONFIG.handLift) {
+    setStatus("손 인식 모델 로드 중...");
+    try {
+      handLandmarker = await createTask(HandLandmarker, fileset, HAND_MODEL, { numHands: 1 });
+    } catch (e) {
+      console.warn("손 인식 로드 실패:", e);
+    }
+  }
+
+  if (CONFIG.occlusion && FaceLandmarker.FACE_LANDMARKS_TESSELATION) {
+    occluderGeometry.setIndex(new THREE.BufferAttribute(
+      buildOccluderIndex(FaceLandmarker.FACE_LANDMARKS_TESSELATION), 1));
+    occluderReady = true;
+  }
+
+  document.getElementById("overlay-msg").remove();
+  setStatus("");
+  ready = true;
+  requestAnimationFrame(loop);
+}
+
+startBtn.addEventListener("click", () =>
+  init().catch((e) => {
+    setStatus("오류: " + e.message);
+    startBtn.disabled = false;
+  })
+);
+
+/* ───────────── 매 프레임 루프 ───────────── */
+let missFrames = 0;
+
+/* ───────────── 손가락으로 안경 올리기 ───────────── */
+const FINGER_TIPS = [8, 4];   // 손 랜드마크의 검지 끝, 엄지 끝
+const faceUpDir = new THREE.Vector3(0, 1, 0);   // 화면상 얼굴의 위쪽 방향 (applyFace에서 갱신)
+const grab = { active: false, startFingerUp: 0, startLift: 0 };
+let handLift = 0;        // 현재 올라간 높이 (모델 mm). 손을 떼도 유지된다
+let handFrame = 0, handMissCount = 0;
+
+function updateHandLift() {
+  if (!handLandmarker || !glassesPivot.visible) return;
+  if (++handFrame % CONFIG.handDetectEvery) return;
+
+  const hand = handLandmarker.detectForVideo(video, performance.now()).landmarks?.[0];
+  if (!hand) {
+    if (++handMissCount > 4) grab.active = false;
+    return;
+  }
+  handMissCount = 0;
+
+  // 브릿지에서 가장 가까운 손가락 끝을 찾는다
+  const scale = glassesPivot.scale.x;
+  const bridge = glassesPivot.position.clone().addScaledVector(faceUpDir, bridgeY * scale);
+  let tip = null, tipDist = Infinity;
+  for (const i of FINGER_TIPS) {
+    const p = toWorld(hand[i]);
+    const d = p.distanceTo(bridge);
+    if (d < tipDist) { tip = p; tipDist = d; }
+  }
+
+  const radius = CONFIG.handGrabRadius * modelWidth * scale;
+  const fingerUp = tip.dot(faceUpDir);
+  if (!grab.active) {
+    if (tipDist < radius) {
+      grab.active = true;
+      grab.startFingerUp = fingerUp;
+      grab.startLift = handLift;
+    }
+  } else if (tipDist > radius * 1.6) {
+    grab.active = false;   // 손가락이 멀어지면 놓은 것으로 판단 (높이는 유지)
+  } else {
+    const lift = grab.startLift + (fingerUp - grab.startFingerUp) / scale;
+    handLift = THREE.MathUtils.clamp(lift, 0, CONFIG.handMaxLiftMM);
+  }
+}
+
+function loop() {
+  if (ready && video.readyState >= 2) {
+    updateHandLift();
+    const result = landmarker.detectForVideo(video, performance.now());
+    const lm = result.faceLandmarks[0];
+    const matrixData = result.facialTransformationMatrixes?.[0]?.data;
+    if (lm) {
+      missFrames = 0;
+      applyFace(lm, matrixData);
+    } else if (!grab.active && ++missFrames > 10) {   // 손이 콧등을 가려 인식이 끊겨도 잡고 있는 동안은 유지
+      glassesPivot.visible = false;
+      occluderMesh.visible = false;
+    }
+  }
+  renderer.render(scene, camera);
+  requestAnimationFrame(loop);
+}
+
+/* ───────────── 랜드마크 → 월드 좌표 ───────────── */
+// 정규화 좌표(0~1, y는 아래 방향) → 월드 좌표 (원점 = 화면 중앙, y는 위 방향)
+const toWorld = (p) => new THREE.Vector3((p.x - 0.5) * visW, -(p.y - 0.5) * visH, 0);
+
+const targetPos = new THREE.Vector3();
+const targetQuat = new THREE.Quaternion();
+const targetRot = new THREE.Euler(0, 0, 0, "YXZ");
+let targetScale = 1;
+let initialized = false;
+
+// 변환 행렬 → 회전 쿼터니언 (MediaPipe 카메라 좌표계 → Three.js 좌표계)
+const _m = new THREE.Matrix4(), _p = new THREE.Vector3(), _s = new THREE.Vector3(), _q = new THREE.Quaternion();
+const FLIP = new THREE.Quaternion(1, 0, 0, 0);   // X축 기준 180° 회전 (y, z 뒤집기)
+function quatFromPoseMatrix(data) {
+  _m.fromArray(data);
+  if (CONFIG.matrixRowMajor) _m.transpose();
+  _m.decompose(_p, _q, _s);                        // 스케일 성분은 버리고 회전만 사용
+  return targetQuat.copy(FLIP).multiply(_q).multiply(FLIP);
+}
+
+const _worldToPivot = new THREE.Matrix4(), _camLocal = new THREE.Vector3(), _earRay = new THREE.Vector3(), _earPoint = new THREE.Vector3();
+
+// 카메라에서 귀 위 기준점으로 향하는 시선이 귀 접촉 깊이에서 지나는 높이를 구해, 다리가 그 높이를 지나도록 힌지에서 회전한다
+function updateTemples(lm) {
+  glassesPivot.updateMatrixWorld(true);
+  _worldToPivot.copy(glassesPivot.matrixWorld).invert();
+  _camLocal.copy(camera.position).applyMatrix4(_worldToPivot);
+  const maxAngle = THREE.MathUtils.degToRad(CONFIG.templeMaxAngleDeg);
+  const reach = TEMPLE_START_Z - EAR_CONTACT_Z;
+  const zRef = (lm[IDX.rightOuter].z + lm[IDX.leftOuter].z) * 0.5;
+  for (const t of temples) {
+    const ear = lm[t.landmark];
+    _earRay.copy(toWorld(ear)).applyMatrix4(_worldToPivot).sub(_camLocal);
+    if (Math.abs(_earRay.z) < 1e-3) continue;
+    const s = (EAR_CONTACT_Z - _camLocal.z) / _earRay.z;
+    if (s <= 0) continue;
+
+    // 위아래: 시선이 귀 접촉 깊이에서 지나는 높이로 맞춤
+    const y = _camLocal.y + _earRay.y * s + CONFIG.earTopOffsetMM;
+    const pitch = Math.atan2(y - t.hingeY, reach) - t.contactAngle;
+    const targetPitch = THREE.MathUtils.clamp(pitch, -maxAngle, maxAngle);
+    t.group.rotation.x = THREE.MathUtils.lerp(t.group.rotation.x, targetPitch, CONFIG.smoothing);
+
+    // 좌우: 화면상 얼굴 윤곽(시선)과 머리 기준 위치(3D) 중 더 바깥쪽을 지나도록 바깥으로만 벌림
+    const side = Math.sign(t.contactX);
+    const rayX = _camLocal.x + _earRay.x * s;
+    _earPoint.copy(toWorld(ear)).setZ(-(ear.z - zRef) * visW).applyMatrix4(_worldToPivot);
+    const outerX = Math.max(rayX * side, _earPoint.x * side) + CONFIG.earOutMM;
+    const spread = Math.atan2(outerX - t.hingeX * side, reach) - Math.atan2((t.contactX - t.hingeX) * side, reach);
+    const targetYaw = -side * THREE.MathUtils.clamp(spread, 0, maxAngle);
+    t.group.rotation.y = THREE.MathUtils.lerp(t.group.rotation.y, targetYaw, CONFIG.smoothing);
+  }
+}
+
+const _lensNormal = new THREE.Vector3(), _lensRight = new THREE.Vector3(), _facePoint = new THREE.Vector3(), _toPoint = new THREE.Vector3();
+
+function applyFace(lm, matrixData) {
+  if (!modelWidth) return;   // 모델이 아직 로드 전이면 대기
+
+  const rO = lm[IDX.rightOuter], lO = lm[IDX.leftOuter];
+  const rOut = toWorld(rO), lOut = toWorld(lO);
+
+  // 1) 크기: 양쪽 눈 바깥 모서리의 3D 거리 기준 (화면 거리만 쓰면 고개를 돌릴 때 안경이 작아짐)
+  const outerDist = Math.hypot(lOut.x - rOut.x, lOut.y - rOut.y, (lO.z - rO.z) * visW);
+  const frameWidth = outerDist * CONFIG.frameRatio;
+  targetScale = frameWidth / modelWidth;
+
+  // 2) 회전
+  if (CONFIG.poseSource === "matrix" && matrixData) {
+    quatFromPoseMatrix(matrixData);
+  } else {
+    // 근사: 롤 = 눈 바깥 모서리 기울기, 요 = 눈 깊이차, 피치 = 이마-턱 기울기
+    const roll = Math.atan2(lOut.y - rOut.y, lOut.x - rOut.x);
+    const yaw = Math.atan2(lO.z - rO.z, Math.abs(lO.x - rO.x)) * CONFIG.yawSign;
+    const fh = lm[IDX.forehead], ch = lm[IDX.chin];
+    const upY = toWorld(fh).y - toWorld(ch).y;
+    const upZ = -(fh.z - ch.z) * visW;
+    const pitch = Math.atan2(upZ, upY) * CONFIG.pitchSign;
+    targetRot.set(pitch, yaw, roll, "YXZ");
+    targetQuat.setFromEuler(targetRot);
+  }
+
+  // 브릿지가 콧등(랜드마크 6)에 걸리도록 위치를 잡는다. 얼굴의 위쪽 방향은 눈을 잇는 선에 수직인 방향
+  const eyeAxis = lOut.clone().sub(rOut).normalize();
+  const faceUp = new THREE.Vector3(-eyeAxis.y, eyeAxis.x, 0);
+  targetPos.copy(toWorld(lm[IDX.noseBridge]))
+    .addScaledVector(faceUp, CONFIG.offsetY * frameWidth + (handLift - bridgeY) * targetScale);
+  faceUpDir.copy(faceUp);
+
+  if (!initialized) {
+    glassesPivot.position.copy(targetPos);
+    glassesPivot.quaternion.copy(targetQuat);
+    glassesPivot.scale.setScalar(targetScale);
+    initialized = true;
+  }
+
+  const k = grab.active ? CONFIG.smoothing * 0.5 : CONFIG.smoothing;   // 손이 얼굴을 가리는 동안은 흔들림을 더 줄임
+  glassesPivot.position.lerp(targetPos, k);
+  glassesPivot.quaternion.slerp(targetQuat, k);
+  glassesPivot.scale.setScalar(THREE.MathUtils.lerp(glassesPivot.scale.x, targetScale, k));
+  glassesPivot.visible = true;
+  updateTemples(lm);
+
+  // 3) 얼굴 가림 메시 갱신 (랜드마크를 월드 좌표로 옮겨 깊이만 기록)
+  // 코·이마·볼은 렌즈 평면보다 앞에 있어 그대로 두면 안경 앞면을 덮고, 메시에 구멍이 있는 눈 부분만 안경이 보인다.
+  // 렌즈 평면보다 앞에 있는 점은 평면 뒤로 밀어서 얼굴이 안경 다리만 가리게 한다.
+  if (occluderReady) {
+    const zRef = (lO.z + rO.z) * 0.5;               // 눈 높이의 깊이 기준
+    const back = CONFIG.occluderBackMM * glassesPivot.scale.x;
+    // 얼굴 메시가 다리보다 옆으로 넓으면 다리 중간이 끊겨 보이므로, 메시의 좌우 폭을 다리 안쪽까지로 제한한다.
+    const sideLimit = (templeInnerX - CONFIG.occluderSideMarginMM) * glassesPivot.scale.x;
+    _lensNormal.set(0, 0, 1).applyQuaternion(glassesPivot.quaternion);
+    _lensRight.set(1, 0, 0).applyQuaternion(glassesPivot.quaternion);
+    for (let i = 0; i < 468; i++) {
+      const p = lm[i];
+      _facePoint.set((p.x - 0.5) * visW, -(p.y - 0.5) * visH, -(p.z - zRef) * visW);   // z 작을수록 카메라에 가까움
+      _toPoint.copy(_facePoint).sub(glassesPivot.position);
+      const front = _toPoint.dot(_lensNormal);
+      const side = _toPoint.dot(_lensRight);
+      if (front > -back) _facePoint.addScaledVector(_lensNormal, -(front + back));
+      if (Math.abs(side) > sideLimit) _facePoint.addScaledVector(_lensRight, Math.sign(side) * sideLimit - side);
+      occluderPositions[i * 3]     = _facePoint.x;
+      occluderPositions[i * 3 + 1] = _facePoint.y;
+      occluderPositions[i * 3 + 2] = _facePoint.z;
+    }
+    occluderGeometry.attributes.position.needsUpdate = true;
+    occluderGeometry.computeBoundingSphere();
+    occluderMesh.visible = true;
+  }
+}
+</script>
+</body>
+</html>
